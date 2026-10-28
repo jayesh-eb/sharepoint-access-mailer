@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SharePoint Access Update - Email Tool</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", Arial, sans-serif; margin: 0; background: #f3f2f1; color: #201f1e; }
+  header { position: sticky; top: 0; z-index: 10; background: #fff; border-bottom: 1px solid #d2d0ce; padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  header label { display: flex; flex-direction: column; font-size: 12px; color: #605e5c; gap: 2px; }
+  header input[type=text], header select { padding: 5px 8px; border: 1px solid #8a8886; border-radius: 3px; font: inherit; font-size: 13px; min-width: 190px; }
+  button { background: #0f6cbd; color: #fff; border: 0; border-radius: 3px; padding: 7px 14px; font: inherit; font-size: 13px; cursor: pointer; }
+  button:hover { background: #0c5a9e; }
+  button.secondary { background: #fff; color: #0f6cbd; border: 1px solid #0f6cbd; }
+  button.secondary:hover { background: #eff6fc; }
+  #progress { font-weight: 600; padding-bottom: 6px; }
+  main { max-width: 1000px; margin: 16px auto; padding: 0 16px 80px; }
+  .card { background: #fff; border: 1px solid #d2d0ce; border-left: 5px solid #d2d0ce; border-radius: 4px; padding: 12px 14px; margin-bottom: 12px; }
+  .card.opened { border-left-color: #f7630c; }
+  .card.done { border-left-color: #107c10; opacity: .55; }
+  .card .row { font-size: 13px; margin: 2px 0; word-break: break-word; }
+  .card .row b { display: inline-block; min-width: 62px; color: #605e5c; }
+  .card .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  .tag { display: inline-block; background: #fff4ce; border: 1px solid #f2c200; color: #5c4400; font-size: 12px; padding: 1px 6px; border-radius: 3px; margin-left: 6px; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: #0f6cbd; font-size: 13px; }
+  .preview { border: 1px solid #edebe9; padding: 12px; margin-top: 8px; background: #fff; overflow-x: auto; }
+  #skipped { background: #fff4ce; border: 1px solid #f2c200; border-radius: 4px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; }
+  #empty { color: #605e5c; padding: 30px 0; text-align: center; }
+  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #323130; color: #fff; padding: 10px 18px; border-radius: 4px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; max-width: 90vw; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <label>Excel file
+    <input type="file" id="file" accept=".xlsx,.xls,.csv">
+  </label>
+  <label>Your name
+    <input type="text" id="sigName">
+  </label>
+  <label>Your email
+    <input type="text" id="sigEmail">
+  </label>
+  <label>Open mode
+    <select id="mode">
+      <option value="formatted">Text filled in + copy bold version (Ctrl+A, Ctrl+V)</option>
+      <option value="plain">Plain text only (no bold)</option>
+    </select>
+  </label>
+  <button id="nextBtn">Open next email &#9654;</button>
+  <span id="progress">Done: 0 / 0</span>
+</header>
+
+<main>
+  <div id="skipped" hidden></div>
+  <div id="empty">Choose an Excel file (.xlsx, .xls or .csv) to begin. Nothing is sent automatically.</div>
+  <div id="cards"></div>
+</main>
+<div id="toast"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script id="core">
+// ---------- Core logic (also exercised by test-sharepoint-mailer.js) ----------
+var DEFAULT_NAME = "Jayesh Kashte";
+var DEFAULT_EMAIL = "jayesh.kashte.external@tkelevator.com";
+var MAX_URL_LEN = 7000;
+
+var COLUMN_ALIASES = {
+  main: ["mainsites", "mainsite"],
+  sub: ["subsites", "subsite"],
+  owner: ["primaryowner", "primaryowners", "owner", "owners"],
+  members: ["members", "member"],
+  visitor: ["visitor", "visitors"]
+};
+
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function normHeader(h) {
+  return String(h == null ? "" : h).toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function cellText(v) {
+  return v == null ? "" : String(v).trim();
+}
+
+function splitList(v) {
+  return cellText(v).split(/[;\r\n]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+}
+
+// "Adsul, Santosh" -> "Santosh Adsul"; the comma would otherwise split into two recipients.
+function displayName(o) {
+  if (o.indexOf("@") > -1 || o.indexOf(",") < 0) return o;
+  var p = o.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+  return p.length === 2 ? p[1] + " " + p[0] : p.join(" ");
+}
+
+function firstName(owners) {
+  var first = displayName(owners[0] || "");
+  var name;
+  if (first.indexOf("@") > -1) {
+    name = first.split("@")[0].split(/[._\-+]+/)[0];
+  } else {
+    name = first.split(/\s+/)[0];
+  }
+  return name ? name.charAt(0).toUpperCase() + name.slice(1).toLowerCase() : "there";
+}
+
+function findColumns(headerRow) {
+  var idx = {};
+  var norm = headerRow.map(normHeader);
+  var missing = [];
+  Object.keys(COLUMN_ALIASES).forEach(function (key) {
+    var i = -1;
+    COLUMN_ALIASES[key].some(function (alias) { i = norm.indexOf(alias); return i > -1; });
+    idx[key] = i;
+    if (i < 0) missing.push(key);
+  });
+  return { idx: idx, missing: missing };
+}
+
+// rows: array of arrays, row 0 = headers. Returns {emails, skipped} or {error, headers}.
+function parseRows(rows) {
+  if (!rows.length) return { error: "The sheet is empty.", headers: [] };
+  var headers = rows[0].map(cellText);
+  var cols = findColumns(rows[0]);
+  var required = ["main", "owner"];
+  var missingRequired = cols.missing.filter(function (k) { return required.indexOf(k) > -1; });
+  if (missingRequired.length) {
+    return { error: "Required column(s) not found: " + missingRequired.join(", "), headers: headers };
+  }
+  var emails = [], skipped = [], lastMain = "";
+  for (var r = 1; r < rows.length; r++) {
+    var row = rows[r] || [];
+    var get = function (k) { return cols.idx[k] > -1 ? row[cols.idx[k]] : ""; };
+    var anyValue = row.some(function (c) { return cellText(c) !== ""; });
+    if (!anyValue) continue;
+    var main = cellText(get("main")) || lastMain;
+    if (cellText(get("main"))) lastMain = main;
+    var sub = cellText(get("sub"));
+    var owners = splitList(get("owner"));
+    if (!owners.length) {
+      skipped.push({ row: r + 1, main: main, sub: sub });
+      continue;
+    }
+    emails.push({
+      row: r + 1, main: main, sub: sub, owners: owners,
+      members: splitList(get("members")), visitors: splitList(get("visitor"))
+    });
+  }
+  return { emails: emails, skipped: skipped, headers: headers };
+}
+
+function siteName(e) { return e.sub ? e.main + " / " + e.sub : e.main; }
+function subjectFor(e) { return "SharePoint: Access Update: " + siteName(e); }
+
+function recipients(e) {
+  var withAt = e.owners.filter(function (o) { return o.indexOf("@") > -1; });
+  return (withAt.length ? withAt : e.owners.map(displayName)).join(";");
+}
+
+var PARAS = {
+  p1: "You are the designated owner of the data held in this SharePoint site and are responsible for determining who should have access.",
+  p2: "The site is currently operating with restricted access as a precaution to minimise the risk of inappropriate access or data leakage. Please review the current users and groups listed below and confirm the appropriate access for each role:",
+  b1: ["Owners \u2013 Full Control:", " Manage permissions, site settings and content. This access should be limited to designated site owners."],
+  b2: ["Members \u2013 Edit:", " Add, edit and delete content. Assign this access only where required for business responsibilities."],
+  b3: ["Visitors \u2013 Read:", " View and download content only. This should be the default access level, with additional permissions granted only where there is a clear business need."],
+  p3: "Access will be updated based on your confirmation, following the principle of least privilege.",
+  p4: "Going forward, any new access request will require your approval, or approval from a nominated co-owner acting on your behalf. Please nominate an appropriate co-owner who can review and approve requests when you are unavailable. Approval confirms the business need; the required permissions will then be administered through the appropriate SharePoint access groups.",
+  p5: "Please review the current users and groups below, confirm the appropriate role for each, identify anyone who should be added or removed, and nominate your co-owner."
+};
+
+function buildPlainBody(e, sig) {
+  return [
+    "Hi " + firstName(e.owners) + ",",
+    "",
+    PARAS.p1,
+    "",
+    PARAS.p2,
+    "",
+    "\u2022 " + PARAS.b1[0] + PARAS.b1[1],
+    "\u2022 " + PARAS.b2[0] + PARAS.b2[1],
+    "\u2022 " + PARAS.b3[0] + PARAS.b3[1],
+    "",
+    PARAS.p3,
+    "",
+    PARAS.p4,
+    "",
+    PARAS.p5
+  ].join("\n");
+}
+
+function buildHtmlBody(e, sig, img) {
+  var p = function (t) { return '<p style="margin:0 0 11pt 0">' + esc(t) + "</p>"; };
+  var imgHtml = img ? '<p style="margin:0 0 11pt 0"><img src="' + img.src + '" width="' + img.w + '" height="' + img.h + '" alt="Current access for ' + esc(siteName(e)) + '"></p>' : "";
+  var li = function (b) { return "<li><b>" + esc(b[0]) + "</b>" + esc(b[1]) + "</li>"; };
+  return '<div style="font-family:Arial,sans-serif;font-size:11pt">' +
+    p("Hi " + firstName(e.owners) + ",") +
+    p(PARAS.p1) + p(PARAS.p2) + imgHtml +
+    "<ul>" + li(PARAS.b1) + li(PARAS.b2) + li(PARAS.b3) + "</ul>" +
+    p(PARAS.p3) + p(PARAS.p4) + p(PARAS.p5) +
+    "</div>";
+}
+
+function buildLink(e, sig, plain) {
+  var url = "https://outlook.office.com/mail/deeplink/compose?to=" + encodeURIComponent(recipients(e)) +
+    "&subject=" + encodeURIComponent(subjectFor(e));
+  if (plain) url += "&body=" + encodeURIComponent(buildPlainBody(e, sig));
+  return url;
+}
+</script>
+<script>
+// ---------- UI ----------
+var $ = function (id) { return document.getElementById(id); };
+var state = { emails: [], status: {} };
+
+function lsGet(k, d) { try { var v = localStorage.getItem(k); return v == null ? d : v; } catch (x) { return d; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (x) { /* ignore */ } }
+
+function loadStatus() {
+  try { state.status = JSON.parse(lsGet("spa_status", "{}")) || {}; } catch (x) { state.status = {}; }
+}
+function saveStatus() { lsSet("spa_status", JSON.stringify(state.status)); }
+
+function getSig() {
+  return { name: $("sigName").value.trim() || DEFAULT_NAME, email: $("sigEmail").value.trim() || DEFAULT_EMAIL };
+}
+
+var toastTimer;
+function toast(msg, ms) {
+  var t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { t.classList.remove("show"); }, ms || 5000);
+}
+
+var imgCache = {};
+
+// Draws the sheet row (Excel-style) as a PNG so it can be pasted into the email.
+function rowImage(e) {
+  var key = JSON.stringify([e.main, e.sub, e.owners, e.members, e.visitors]);
+  if (imgCache[key]) return imgCache[key];
+  var cols = [["Main Sites", 150, [e.main], true], ["Sub-Sites", 140, e.sub ? [e.sub] : [], false],
+    ["Primary Owner", 190, e.owners, false], ["Members", 170, e.members, false], ["Visitor", 170, e.visitors, false]];
+  var S = 2, PAD = 8, LH = 18, HEAD = 28;
+  var width = cols.reduce(function (a, c) { return a + c[1]; }, 0);
+  var cv = document.createElement("canvas");
+  var ctx = cv.getContext("2d");
+  var wrap = function (text, maxW, font) {
+    ctx.font = font;
+    var lines = [], cur = "";
+    text.split(/\s+/).forEach(function (w) {
+      var t = cur ? cur + " " + w : w;
+      if (cur && ctx.measureText(t).width > maxW) { lines.push(cur); cur = w; } else cur = t;
+    });
+    if (cur) lines.push(cur);
+    return lines;
+  };
+  var cells = cols.map(function (c) {
+    var font = (c[3] ? "bold " : "") + "13px Arial, sans-serif";
+    var lines = [];
+    c[2].forEach(function (v) { lines = lines.concat(wrap(v, c[1] - 2 * PAD, font)); });
+    return { lines: lines, font: font };
+  });
+  var maxLines = Math.max(1, Math.max.apply(null, cells.map(function (c) { return c.lines.length; })));
+  var height = HEAD + maxLines * LH + 2 * PAD;
+  cv.width = width * S;
+  cv.height = height * S;
+  ctx = cv.getContext("2d");
+  ctx.scale(S, S);
+  ctx.fillStyle = "#D9E1F2";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "#4472C4";
+  ctx.fillRect(0, 0, width, HEAD);
+  ctx.textBaseline = "middle";
+  var x = 0;
+  cols.forEach(function (c, i) {
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 13px Arial, sans-serif";
+    ctx.fillText(c[0], x + PAD, HEAD / 2);
+    ctx.fillStyle = "#000";
+    ctx.font = cells[i].font;
+    cells[i].lines.forEach(function (ln, j) { ctx.fillText(ln, x + PAD, HEAD + PAD + j * LH + LH / 2); });
+    x += c[1];
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(x - 1, 0, 1, height);
+  });
+  imgCache[key] = { src: cv.toDataURL("image/png"), w: width, h: height };
+  return imgCache[key];
+}
+
+function fullBody(e, sig) { return buildHtmlBody(e, sig, rowImage(e)); }
+
+function copyHtml(html) {
+  var box = document.createElement("div");
+  box.style.cssText = "position:fixed;left:-9999px;top:0;white-space:normal";
+  box.innerHTML = html;
+  document.body.appendChild(box);
+  var sel = window.getSelection();
+  var range = document.createRange();
+  range.selectNodeContents(box);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  var ok = false;
+  try { ok = document.execCommand("copy"); } catch (x) { ok = false; }
+  sel.removeAllRanges();
+  document.body.removeChild(box);
+  return ok;
+}
+
+function st(e) { return state.status[subjectFor(e)] || {}; }
+function setSt(e, patch) {
+  var k = subjectFor(e);
+  state.status[k] = Object.assign({}, state.status[k], patch);
+  saveStatus();
+}
+
+function openEmail(e, forceMode) {
+  var sig = getSig();
+  var mode = forceMode || $("mode").value;
+  var plainOnly = mode === "plain";
+  // Always prefill the text so the draft is never blank; skip it only if the link would be too long.
+  var prefill = buildLink(e, sig, true).length <= MAX_URL_LEN;
+  var url = buildLink(e, sig, prefill);
+  // Open first, copy second, or the browser blocks the pop-up.
+  var w = window.open(url, "_blank");
+  if (!w) {
+    toast("Pop-up blocked. Allow pop-ups for this page and try again.");
+    return;
+  }
+  if (!plainOnly) {
+    var copied = copyHtml(fullBody(e, sig));
+    toast(copied
+      ? (prefill ? "For bold + table: in the Outlook message body press Ctrl+A, then Ctrl+V." : "Body copied. Click in the message area and press Ctrl+V.")
+      : "Could not copy automatically \u2013 use \"Copy formatted body\"", 15000);
+  }
+  setSt(e, { opened: true });
+  render();
+}
+
+function copyBody(e) {
+  toast(copyHtml(fullBody(e, getSig())) ? "Formatted body copied \u2013 click in the message and press Ctrl+V" : "Copy failed");
+}
+
+function render() {
+  var cards = $("cards");
+  cards.innerHTML = "";
+  var sig = getSig();
+  var done = 0;
+  state.emails.forEach(function (e) {
+    var s = st(e);
+    if (s.done) done++;
+    var plainLen = buildLink(e, sig, true).length;
+    var card = document.createElement("div");
+    card.className = "card" + (s.done ? " done" : s.opened ? " opened" : "");
+    card.innerHTML =
+      '<div class="row"><b>Row</b>' + e.row + (plainLen > MAX_URL_LEN ? '<span class="tag">Plain-text link is long (' + plainLen + ' chars) &ndash; use formatted mode</span>' : "") + "</div>" +
+      '<div class="row"><b>To</b>' + esc(recipients(e)) + "</div>" +
+      '<div class="row"><b>Subject</b>' + esc(subjectFor(e)) + "</div>" +
+      '<div class="actions"></div>' +
+      "<details><summary>Preview</summary><div class=\"preview\">" + fullBody(e, sig) + "</div></details>";
+    var actions = card.querySelector(".actions");
+
+    var b1 = document.createElement("button");
+    b1.textContent = "Open in Outlook";
+    b1.onclick = function () { openEmail(e); };
+    var b2 = document.createElement("button");
+    b2.className = "secondary";
+    b2.textContent = "Copy formatted body";
+    b2.onclick = function () { copyBody(e); };
+    var lab = document.createElement("label");
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!s.done;
+    cb.onchange = function () { setSt(e, { done: cb.checked }); render(); };
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(" Done"));
+    actions.appendChild(b1); actions.appendChild(b2); actions.appendChild(lab);
+    cards.appendChild(card);
+  });
+  $("progress").textContent = "Done: " + done + " / " + state.emails.length;
+}
+
+function showSkipped(skipped) {
+  var box = $("skipped");
+  if (!skipped.length) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = "<b>Skipped (no Primary Owner):</b><br>" + skipped.map(function (s) {
+    return "Excel row " + s.row + ": " + esc(s.main + (s.sub ? " / " + s.sub : ""));
+  }).join("<br>");
+}
+
+function loadFile(file) {
+  var reader = new FileReader();
+  reader.onload = function (ev) {
+    try {
+      var wb = XLSX.read(ev.target.result, { type: "array" });
+      var ws = wb.Sheets[wb.SheetNames[0]];
+      var rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: false });
+      var res = parseRows(rows);
+      if (res.error) {
+        alert(res.error + "\n\nHeaders found: " + (res.headers.filter(Boolean).join(", ") || "(none)") +
+          "\n\nExpected: Main Sites, Sub-Sites, Primary Owner, Members, Visitor");
+        return;
+      }
+      state.emails = res.emails;
+      $("empty").hidden = true;
+      showSkipped(res.skipped);
+      render();
+    } catch (x) {
+      alert("Could not read the file: " + x.message);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+$("file").addEventListener("change", function (ev) { if (ev.target.files[0]) loadFile(ev.target.files[0]); });
+$("nextBtn").addEventListener("click", function () {
+  var next = state.emails.filter(function (e) { var s = st(e); return !s.opened && !s.done; })[0];
+  if (!next) { toast("No more unopened emails."); return; }
+  openEmail(next);
+});
+["sigName", "sigEmail"].forEach(function (id) {
+  $(id).addEventListener("input", function () {
+    lsSet(id === "sigName" ? "spa_name" : "spa_email", $(id).value);
+    if (state.emails.length) render();
+  });
+});
+$("mode").addEventListener("change", function () { lsSet("spa_mode4", $("mode").value); });
+
+$("sigName").value = lsGet("spa_name", DEFAULT_NAME);
+$("sigEmail").value = lsGet("spa_email", DEFAULT_EMAIL);
+$("mode").value = lsGet("spa_mode4", "formatted");
+loadStatus();
+</script>
+</body>
+</html>
