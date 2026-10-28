@@ -37,20 +37,19 @@
   <label>Excel file
     <input type="file" id="file" accept=".xlsx,.xls,.csv">
   </label>
-  <label>Your name
-    <input type="text" id="sigName">
-  </label>
-  <label>Your email
-    <input type="text" id="sigEmail">
-  </label>
   <label>Open mode
     <select id="mode">
       <option value="formatted">Text filled in + copy bold version (Ctrl+A, Ctrl+V)</option>
       <option value="plain">Plain text only (no bold)</option>
+      <option value="desktop">Outlook desktop (opens app, then Ctrl+V)</option>
     </select>
   </label>
   <button id="nextBtn">Open next email &#9654;</button>
   <span id="progress">Done: 0 / 0</span>
+  <button id="expBtn" class="secondary" title="Download your Done/Opened marks as a backup file">Save progress</button>
+  <button id="impBtn" class="secondary" title="Restore marks from a backup file">Load progress</button>
+  <button id="clrBtn" class="secondary" title="Erase all Done/Opened marks">Clear progress</button>
+  <input type="file" id="impFile" accept=".json" hidden>
 </header>
 
 <main>
@@ -63,8 +62,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script id="core">
 // ---------- Core logic (also exercised by test-sharepoint-mailer.js) ----------
-var DEFAULT_NAME = "Jayesh Kashte";
-var DEFAULT_EMAIL = "jayesh.kashte.external@tkelevator.com";
 var MAX_URL_LEN = 7000;
 
 var COLUMN_ALIASES = {
@@ -199,10 +196,41 @@ function buildHtmlBody(e, sig, img) {
   var li = function (b) { return "<li><b>" + esc(b[0]) + "</b>" + esc(b[1]) + "</li>"; };
   return '<div style="font-family:Arial,sans-serif;font-size:11pt">' +
     p("Hi " + firstName(e.owners) + ",") +
-    p(PARAS.p1) + p(PARAS.p2) + imgHtml +
+    p(PARAS.p1) + imgHtml + p(PARAS.p2) +
     "<ul>" + li(PARAS.b1) + li(PARAS.b2) + li(PARAS.b3) + "</ul>" +
     p(PARAS.p3) + p(PARAS.p4) + p(PARAS.p5) +
     "</div>";
+}
+
+// Unsent .eml draft: desktop Outlook opens it in compose mode with bold, bullets and the inline picture.
+function buildEml(e, imgB64, imgW, imgH) {
+  var b64 = function (s) { return btoa(unescape(encodeURIComponent(s))); };
+  var wrap76 = function (s) { return s.replace(/.{1,76}/g, "$&\r\n").replace(/\r\n$/, ""); };
+  var html = buildHtmlBody(e, null, { src: "cid:rowimg", w: imgW, h: imgH });
+  var subject = subjectFor(e);
+  var boundary = "----=_spa_" + Date.now().toString(36);
+  return [
+    "X-Unsent: 1",
+    "To: " + recipients(e).replace(/;/g, ", "),
+    "Subject: =?UTF-8?B?" + b64(subject) + "?=",
+    "MIME-Version: 1.0",
+    'Content-Type: multipart/related; boundary="' + boundary + '"; type="text/html"',
+    "",
+    "--" + boundary,
+    "Content-Type: text/html; charset=utf-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    wrap76(b64('<html><body>' + html + '</body></html>')),
+    "--" + boundary,
+    "Content-Type: image/png; name=\"access.png\"",
+    "Content-Transfer-Encoding: base64",
+    "Content-ID: <rowimg>",
+    'Content-Disposition: inline; filename="access.png"',
+    "",
+    wrap76(imgB64),
+    "--" + boundary + "--",
+    ""
+  ].join("\r\n");
 }
 
 function buildLink(e, sig, plain) {
@@ -225,9 +253,7 @@ function loadStatus() {
 }
 function saveStatus() { lsSet("spa_status", JSON.stringify(state.status)); }
 
-function getSig() {
-  return { name: $("sigName").value.trim() || DEFAULT_NAME, email: $("sigEmail").value.trim() || DEFAULT_EMAIL };
-}
+function getSig() { return {}; }
 
 var toastTimer;
 function toast(msg, ms) {
@@ -319,9 +345,44 @@ function setSt(e, patch) {
   saveStatus();
 }
 
+function openDesktop(e) {
+  var copied = copyHtml(fullBody(e, getSig()));
+  // Shortest valid encoding (LF, literal , : ;) so the body fits Windows' ~2083-char link limit.
+  var enc = function (s) { return encodeURIComponent(s).replace(/%2C/g, ",").replace(/%3A/g, ":").replace(/%3B/g, ";"); };
+  var base = "mailto:" + enc(recipients(e)) + "?subject=" + enc(subjectFor(e));
+  var withBody = base + "&body=" + enc(buildPlainBody(e, getSig()));
+  var prefill = withBody.length <= 2080;
+  var a = document.createElement("a");
+  a.href = prefill ? withBody : base;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  toast(prefill
+    ? "Outlook desktop is opening with the text filled in. For bold + picture: click in the body, Ctrl+A, then Ctrl+V."
+    : "Outlook desktop is opening. Click in the message body and press Ctrl+V to paste the email.", 15000);
+  setSt(e, { opened: true });
+  render();
+}
+
+function downloadEml(e) {
+  var img = rowImage(e);
+  var eml = buildEml(e, img.src.split(",")[1], img.w, img.h);
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([eml], { type: "message/rfc822" }));
+  a.download = subjectFor(e).replace(/[^\w\- ]+/g, "_") + ".eml";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+  toast("Draft downloaded. Open the .eml file to get it in Outlook desktop, then review and Send.", 10000);
+  setSt(e, { opened: true });
+  render();
+}
+
 function openEmail(e, forceMode) {
   var sig = getSig();
   var mode = forceMode || $("mode").value;
+  if (mode === "desktop") { openDesktop(e); return; }
   var plainOnly = mode === "plain";
   // Always prefill the text so the draft is never blank; skip it only if the link would be too long.
   var prefill = buildLink(e, sig, true).length <= MAX_URL_LEN;
@@ -340,6 +401,14 @@ function openEmail(e, forceMode) {
   }
   setSt(e, { opened: true });
   render();
+}
+
+function copyPicture(e) {
+  var img = rowImage(e);
+  if (!navigator.clipboard || !window.ClipboardItem) { toast("This browser cannot copy pictures. Right-click the picture in Preview and choose Copy image.", 10000); return; }
+  navigator.clipboard.write([new ClipboardItem({ "image/png": fetch(img.src).then(function (r) { return r.blob(); }) })])
+    .then(function () { toast("Picture copied. In the email, click where it should go and press Ctrl+V.", 10000); })
+    .catch(function () { toast("Could not copy the picture. Right-click it in Preview and choose Copy image.", 10000); });
 }
 
 function copyBody(e) {
@@ -366,12 +435,23 @@ function render() {
     var actions = card.querySelector(".actions");
 
     var b1 = document.createElement("button");
-    b1.textContent = "Open in Outlook";
+    b1.textContent = "Open in Outlook (web)";
     b1.onclick = function () { openEmail(e); };
+    var bd = document.createElement("button");
+    bd.textContent = "Open in Outlook desktop";
+    bd.onclick = function () { openDesktop(e); };
+    var bf = document.createElement("button");
+    bf.className = "secondary";
+    bf.textContent = "Draft file (.eml)";
+    bf.onclick = function () { downloadEml(e); };
     var b2 = document.createElement("button");
     b2.className = "secondary";
     b2.textContent = "Copy formatted body";
     b2.onclick = function () { copyBody(e); };
+    var bp = document.createElement("button");
+    bp.className = "secondary";
+    bp.textContent = "Copy picture";
+    bp.onclick = function () { copyPicture(e); };
     var lab = document.createElement("label");
     var cb = document.createElement("input");
     cb.type = "checkbox";
@@ -379,7 +459,7 @@ function render() {
     cb.onchange = function () { setSt(e, { done: cb.checked }); render(); };
     lab.appendChild(cb);
     lab.appendChild(document.createTextNode(" Done"));
-    actions.appendChild(b1); actions.appendChild(b2); actions.appendChild(lab);
+    actions.appendChild(bd); actions.appendChild(bf); actions.appendChild(b1); actions.appendChild(b2); actions.appendChild(bp); actions.appendChild(lab);
     cards.appendChild(card);
   });
   $("progress").textContent = "Done: " + done + " / " + state.emails.length;
@@ -424,16 +504,43 @@ $("nextBtn").addEventListener("click", function () {
   if (!next) { toast("No more unopened emails."); return; }
   openEmail(next);
 });
-["sigName", "sigEmail"].forEach(function (id) {
-  $(id).addEventListener("input", function () {
-    lsSet(id === "sigName" ? "spa_name" : "spa_email", $(id).value);
-    if (state.emails.length) render();
-  });
+$("expBtn").addEventListener("click", function () {
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(state.status, null, 2)], { type: "application/json" }));
+  a.download = "sharepoint-mailer-progress.json";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
 });
+$("impBtn").addEventListener("click", function () { $("impFile").click(); });
+$("impFile").addEventListener("change", function (ev) {
+  var f = ev.target.files[0];
+  if (!f) return;
+  var r = new FileReader();
+  r.onload = function () {
+    try {
+      Object.assign(state.status, JSON.parse(r.result));
+      saveStatus();
+      render();
+      toast("Progress loaded.");
+    } catch (x) { alert("That is not a valid progress file."); }
+  };
+  r.readAsText(f);
+  ev.target.value = "";
+});
+$("clrBtn").addEventListener("click", function () {
+  if (!confirm("Erase all Done/Opened marks? This cannot be undone.")) return;
+  state.status = {};
+  saveStatus();
+  render();
+});
+
+// Ask the browser not to evict saved marks under storage pressure.
+try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (x) { /* ignore */ }
+
 $("mode").addEventListener("change", function () { lsSet("spa_mode4", $("mode").value); });
 
-$("sigName").value = lsGet("spa_name", DEFAULT_NAME);
-$("sigEmail").value = lsGet("spa_email", DEFAULT_EMAIL);
 $("mode").value = lsGet("spa_mode4", "formatted");
 loadStatus();
 </script>
